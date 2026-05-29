@@ -11,12 +11,12 @@ DB_PATH = "stock_data.db"
 EXCEL_OUTPUT_PATH = "까리존345임시결과.xlsx"
 
 UNIT_MONEY = 1000000  # 1차 진입 원금: 100만 원
-END_SIMULATION_DATE = "2026-05-29"  # 최종 추적 종료일
+END_SIMULATION_DATE = "2026-05-29"
 
 
 def get_user_date_range():
     print("=" * 80)
-    print(" [까리존 345 백테스트 - 하이브리드 자동 매매 익절/추매 완결판]")
+    print(" [까리존 345 백테스트 - 1기준봉 1진입 및 중복배제 완결판]")
     print("=" * 80)
 
     while True:
@@ -137,11 +137,10 @@ def main():
     peak_capital = 0
     trade_logs = []
 
-    # 시계열 타임라인 마스터 연산
     for current_date in timeline:
         cleared_codes = []
 
-        # --- A. 보유 종목 장중 자동 매수/매도 감시 (기계의 영역) ---
+        # --- A. 보유 종목 장중 자동 매수/매도 감시 ---
         for code, stock in portfolio.items():
             cursor.execute("SELECT open, high, low, close FROM daily_prices WHERE code = ? AND date = ?",
                            (code, current_date))
@@ -154,7 +153,6 @@ def main():
             holding_days = stock["holding_days"]
             signal_date = stock["signal_date"]
 
-            # [1단계] 장중 저가 우선 판정 (Worst-case 및 연쇄 자동추매 배팅)
             pyramided_today = False
             p_43_price = base_high * 0.57
             p_50_price = base_high * 0.50
@@ -187,10 +185,8 @@ def main():
             if pyramided_today:
                 stock["avg_price"] = stock["total_spent"] / stock["total_qty"]
 
-            # [2단계] 자동 익절/본절 판정 (장중 실시간 매도 작동)
             avg_price = stock["avg_price"]
 
-            # 추매 내역이 있거나 10일 장기 횡보(WAIT) 상태이면 목표가는 본절(0%수익), 그 외 평시는 +6% 익절
             if len(stock["triggered_phases"]) > 1 or stock["status"] == "WAIT":
                 target_exit_price = avg_price
                 exit_type = "본절마감(0%)"
@@ -200,7 +196,6 @@ def main():
                 exit_type = "익절청산(+6%)"
                 profit = int(stock["total_spent"] * 0.06)
 
-            # 당일 고가가 실시간 변경된 목표가 이상으로 치솟으면 당일 즉시 탈출 허용!
             if s_high >= target_exit_price:
                 trade_logs.append({
                     "종목명": stock["name"], "종목코드": code, "청산유형": exit_type,
@@ -214,20 +209,26 @@ def main():
                 cleared_codes.append(code)
                 continue
 
-            # 10일 차 장마감 시점 횡보 전환 룰 적용
             if holding_days == 10 and stock["status"] == "HOLD" and code not in cleared_codes:
                 stock["status"] = "WAIT"
 
-            # 미청산 시 리얼타임 데이터 백업
             all_target_audit_logs[(code, signal_date)].update({
                 "최종상태": f"보유중({stock['status']})", "최초매수일": stock["buy_date"], "총투자금액": stock["total_spent"]
             })
 
         for c_code in cleared_codes: del portfolio[c_code]
 
-        # --- B. 신규 종목 진입 감시 (인간의 영역 - 100% 장마감 종가 기준 배팅) ---
+        # --- B. 신규 종목 진입 감시 (인간의 영역 - 중복매수 금지 룰 반영) ---
         for (code, s_date), signal in pending_signals.items():
-            if not signal["active"] or code in portfolio: continue
+            if not signal["active"]: continue
+
+            # ★ [수정 1] 동일 종목을 이미 보유 중일 때, 새로운 기준봉이 뜬다면 신규 감시 강제 종료 (패스)
+            if code in portfolio:
+                if current_date == s_date:
+                    signal["active"] = False
+                    all_target_audit_logs[(code, s_date)].update({"최종상태": "매수제외(보유중중복)"})
+                continue
+
             if current_date <= s_date: continue
 
             signal["wait_days"] += 1
@@ -248,19 +249,19 @@ def main():
             p_43_price = base_high * 0.57
             p_50_price = base_high * 0.50
 
-            # [수정] 종가가 -50% 이하로 추락하면 장마감 때 보고 무조건 진입 차단 (진입 전 관삭)
             if d_close <= p_50_price:
                 signal["active"] = False
                 all_target_audit_logs[(code, s_date)].update({"최종상태": "미체결(진입전관삭)"})
                 continue
 
-            # [수정] 종가가 -33% 이하 영역에 정착했을 때만 종가 가격으로 안전 진입
             if d_close <= p_33_price:
+                # ★ [수정 2] 종가 진입이 확정되면, 해당 기준봉의 신규 매수 역할은 즉시 영구 종료!
+                signal["active"] = False
+
                 phases = ["33"]
                 total_spent = UNIT_MONEY
                 history_list = [f"[-33%종가진입]:{current_date}"]
 
-                # 만약 종가가 -43% 이하 영역까지 뚫린 채 마감했다면 2차 자금까지 종가 단가로 한 번에 탑승!
                 if d_close <= p_43_price:
                     total_spent += int(UNIT_MONEY * 1.1)
                     phases.append("43")
@@ -302,9 +303,9 @@ def main():
         df_audit_sheet.to_excel(writer, sheet_name="전수조사종목현황", index=False)
 
     print("\n" + "=" * 115)
-    print(f" [하이브리드 자동 매도/매수 시뮬레이션 완결]")
+    print(f" [1기준봉 1진입 및 중복배제 시뮬레이션 완결]")
     print(f" ▶ 파일 저장 완료 : {EXCEL_OUTPUT_PATH}")
-    print(f" ▶ 종가 배팅과 실시간 기계 추매/익절의 정교한 조합 결과 리포트가 도출되었습니다.")
+    print(f" ▶ 단물이 빠진 과거 종목은 재진입하지 않으며, 보유 중 뜬 새 기준봉은 익절에 기여 후 패스됩니다.")
     print("=" * 115)
 
 
